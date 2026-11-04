@@ -3,17 +3,17 @@ import sqlite3
 import time
 import secrets
 import requests
-from flask import Flask, request, redirect, render_template_string
+from flask import Flask, request, redirect, render_template_string, jsonify
 
 app = Flask(__name__)
 
-# ====== CẤU HÌNH (lấy từ biến môi trường, xem README.md) ======
+# ====== CẤU HÌNH (lấy từ biến môi trường) ======
 CLIENT_ID = os.environ["DISCORD_CLIENT_ID"]
 CLIENT_SECRET = os.environ["DISCORD_CLIENT_SECRET"]
 BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 REDIRECT_URI = os.environ["REDIRECT_URI"]  # vd: https://yourdomain.com/callback
-VERIFIED_ROLE_ID = os.environ["VERIFIED_ROLE_ID"]
-LOG_WEBHOOK_URL = os.environ.get("LOG_WEBHOOK_URL")  # webhook Discord để báo admin (không bắt buộc)
+SETUP_SECRET = os.environ["SETUP_SECRET"]  # mật khẩu bí mật để bot gọi API set role, tự đặt tuỳ ý
+LOG_WEBHOOK_URL = os.environ.get("LOG_WEBHOOK_URL")  # fallback nếu server không set webhook riêng
 DB_PATH = os.environ.get("DB_PATH", "verify.db")
 
 DISCORD_API = "https://discord.com/api/v10"
@@ -30,15 +30,54 @@ def db():
             verified_at INTEGER NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS guild_settings (
+            guild_id TEXT PRIMARY KEY,
+            role_id TEXT NOT NULL,
+            webhook_url TEXT
+        )
+    """)
     return conn
 
 def get_real_ip():
-    # Nếu chạy sau reverse proxy / platform hosting (Render, Railway, nginx...),
-    # IP thật nằm trong header X-Forwarded-For. Nếu chạy trực tiếp thì dùng remote_addr.
     xff = request.headers.get("X-Forwarded-For", "")
     if xff:
         return xff.split(",")[0].strip()
     return request.remote_addr
+
+def get_guild_settings(guild_id):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT role_id, webhook_url FROM guild_settings WHERE guild_id = ?", (guild_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row  # (role_id, webhook_url) hoặc None
+
+# ====== API nội bộ: bot gọi vào đây để set role verify cho server của họ ======
+# Dùng lệnh !setverifyrole trong bot.py (xem bot_snippet.py)
+@app.route("/api/set-role", methods=["POST"])
+def api_set_role():
+    data = request.get_json(silent=True) or {}
+    if data.get("secret") != SETUP_SECRET:
+        return jsonify({"ok": False, "error": "sai secret"}), 403
+
+    guild_id = str(data.get("guild_id", ""))
+    role_id = str(data.get("role_id", ""))
+    webhook_url = data.get("webhook_url")  # không bắt buộc
+    if not guild_id or not role_id:
+        return jsonify({"ok": False, "error": "thiếu guild_id/role_id"}), 400
+
+    conn = db()
+    conn.execute(
+        """INSERT INTO guild_settings (guild_id, role_id, webhook_url)
+           VALUES (?, ?, ?)
+           ON CONFLICT(guild_id) DO UPDATE SET role_id=excluded.role_id,
+             webhook_url=COALESCE(excluded.webhook_url, guild_settings.webhook_url)""",
+        (guild_id, role_id, webhook_url),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
 
 # ====== BƯỚC 1: User bấm nút trong Discord -> vào đây ======
 @app.route("/verify")
@@ -47,9 +86,15 @@ def verify_start():
     if not guild_id:
         return "Thiếu tham số guild.", 400
 
-    # state giúp mình biết request callback này thuộc guild nào + chống giả mạo (CSRF)
-    state = f"{guild_id}:{secrets.token_urlsafe(16)}"
+    settings = get_guild_settings(guild_id)
+    if not settings:
+        return render_result(
+            "⚠️ Server này chưa được cấu hình role verify. Admin cần gõ "
+            "`!setverifyrole @role` trong Discord trước.",
+            False,
+        )
 
+    state = f"{guild_id}:{secrets.token_urlsafe(16)}"
     params = {
         "client_id": CLIENT_ID,
         "redirect_uri": REDIRECT_URI,
@@ -61,7 +106,7 @@ def verify_start():
     url = requests.Request("GET", f"{DISCORD_API}/oauth2/authorize", params=params).prepare().url
     return redirect(url)
 
-# ====== BƯỚC 2: Discord gửi user quay lại đây sau khi họ bấm "Authorize" ======
+# ====== BƯỚC 2: Discord gửi user quay lại đây sau khi họ Authorize ======
 @app.route("/callback")
 def callback():
     code = request.args.get("code")
@@ -70,8 +115,11 @@ def callback():
         return render_result("❌ Yêu cầu không hợp lệ.", False)
 
     guild_id = state.split(":", 1)[0]
+    settings = get_guild_settings(guild_id)
+    if not settings:
+        return render_result("❌ Server này chưa được cấu hình role verify.", False)
+    role_id, guild_webhook = settings
 
-    # Đổi code lấy access token
     token_res = requests.post(
         f"{DISCORD_API}/oauth2/token",
         data={
@@ -87,7 +135,6 @@ def callback():
         return render_result("❌ Xác thực với Discord thất bại, thử lại.", False)
     access_token = token_res.json()["access_token"]
 
-    # Lấy thông tin user Discord (identify)
     user_res = requests.get(
         f"{DISCORD_API}/users/@me",
         headers={"Authorization": f"Bearer {access_token}"},
@@ -96,22 +143,19 @@ def callback():
         return render_result("❌ Không lấy được thông tin tài khoản Discord.", False)
     user = user_res.json()
     discord_id = user["id"]
-    username = f'{user["username"]}'
+    username = user["username"]
 
     ip = get_real_ip()
     now = int(time.time())
 
     conn = db()
     cur = conn.cursor()
-
-    # Kiểm tra IP này đã từng verify cho 1 Discord ID KHÁC chưa
     cur.execute(
         "SELECT discord_id, username FROM verifications WHERE ip = ? AND discord_id != ?",
         (ip, discord_id),
     )
     alt_matches = cur.fetchall()
 
-    # Lưu/ cập nhật record của chính user này
     cur.execute(
         """INSERT INTO verifications (discord_id, guild_id, username, ip, verified_at)
            VALUES (?, ?, ?, ?, ?)
@@ -123,10 +167,10 @@ def callback():
     conn.commit()
     conn.close()
 
+    webhook = guild_webhook or LOG_WEBHOOK_URL
+
     if alt_matches:
-        # KHÔNG tự động cấp role khi nghi ngờ trùng IP — chỉ báo admin, để admin tự quyết định.
-        # (Trùng IP có thể do dùng chung wifi/mạng di động, không chắc chắn 100% là alt.)
-        notify_admin(guild_id, discord_id, username, ip, alt_matches)
+        notify_admin(webhook, guild_id, discord_id, username, ip, alt_matches)
         return render_result(
             "⚠️ Tài khoản của bạn đã được ghi nhận, nhưng hệ thống phát hiện IP này "
             "từng được dùng để verify cho tài khoản Discord khác. Quản trị viên server "
@@ -134,25 +178,25 @@ def callback():
             False,
         )
 
-    ok = assign_role(guild_id, discord_id)
+    ok = assign_role(guild_id, discord_id, role_id)
     if not ok:
         return render_result(
-            "⚠️ Xác thực thành công nhưng bot không gán được role (có thể bot thiếu quyền "
-            "hoặc bạn đã rời server). Báo admin kiểm tra giúp.",
+            "⚠️ Xác thực thành công nhưng bot không gán được role (có thể bot thiếu quyền, "
+            "role cao hơn role của bot, hoặc bạn đã rời server). Báo admin kiểm tra giúp.",
             False,
         )
 
     return render_result("✅ Xác thực thành công! Quay lại Discord, bạn đã được cấp quyền.", True)
 
-def assign_role(guild_id, user_id):
+def assign_role(guild_id, user_id, role_id):
     res = requests.put(
-        f"{DISCORD_API}/guilds/{guild_id}/members/{user_id}/roles/{VERIFIED_ROLE_ID}",
+        f"{DISCORD_API}/guilds/{guild_id}/members/{user_id}/roles/{role_id}",
         headers={"Authorization": f"Bot {BOT_TOKEN}"},
     )
     return res.status_code == 204
 
-def notify_admin(guild_id, discord_id, username, ip, alt_matches):
-    if not LOG_WEBHOOK_URL:
+def notify_admin(webhook_url, guild_id, discord_id, username, ip, alt_matches):
+    if not webhook_url:
         return
     alt_list = ", ".join(f"`{uid}` ({uname})" for uid, uname in alt_matches)
     content = (
@@ -162,7 +206,7 @@ def notify_admin(guild_id, discord_id, username, ip, alt_matches):
         f"Guild: `{guild_id}`"
     )
     try:
-        requests.post(LOG_WEBHOOK_URL, json={"content": content}, timeout=5)
+        requests.post(webhook_url, json={"content": content}, timeout=5)
     except Exception:
         pass
 
